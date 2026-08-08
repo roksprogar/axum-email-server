@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mail_addresses (domain_id, local_part, label, active)\n               VALUES ($1, $2, $3, true)\n               ON CONFLICT (domain_id, local_part)\n               DO UPDATE SET active = true,\n                             label = COALESCE(EXCLUDED.label, mail_addresses.label)\n               RETURNING id, local_part, label, active, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "local_part",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "label",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "1b58f1954f73f05142c05da5743f5688e4020109c55ac7e6d4a745d63dd405df"
+}

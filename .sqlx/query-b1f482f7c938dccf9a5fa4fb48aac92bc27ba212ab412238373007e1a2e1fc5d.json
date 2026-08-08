@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, filename, content_type, size_bytes, storage_path\n               FROM mail_attachments WHERE message_id = $1 ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "filename",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "size_bytes",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "storage_path",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b1f482f7c938dccf9a5fa4fb48aac92bc27ba212ab412238373007e1a2e1fc5d"
+}

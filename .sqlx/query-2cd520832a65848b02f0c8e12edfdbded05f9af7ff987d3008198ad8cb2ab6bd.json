@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM mail_replies WHERE message_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2cd520832a65848b02f0c8e12edfdbded05f9af7ff987d3008198ad8cb2ab6bd"
+}

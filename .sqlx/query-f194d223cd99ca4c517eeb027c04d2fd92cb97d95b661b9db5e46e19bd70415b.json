@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id FROM mail_addresses a\n             JOIN mail_domains d ON d.id = a.domain_id\n             WHERE d.domain = $1 AND a.local_part = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f194d223cd99ca4c517eeb027c04d2fd92cb97d95b661b9db5e46e19bd70415b"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mail_messages SET read_at = now() WHERE id = $1 AND read_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de71c4a75ad95ba380e983a6555708d77dd2148149591a09ecbd4e8d3c3a59d6"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM mail_attachments WHERE message_id IN\n                (SELECT id FROM mail_messages WHERE address_id = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a280d8b30cf8f8bed8677506563bb3b1df1d37384d1ce9134a32432da5708516"
+}
