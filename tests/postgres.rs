@@ -9,6 +9,12 @@
 use axum_email_server::{MessageFilter, NewReply, PostgresStorage, RawMessage, Storage};
 use sqlx::postgres::PgPoolOptions;
 
+/// Both Postgres tests DROP/CREATE the same tables in the one shared database,
+/// so they must not run concurrently (the default test harness runs them in
+/// parallel, and CI does not pass `--test-threads=1`). This lock serializes
+/// them. A tokio mutex, so holding it across `.await` is fine.
+static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn apply_schema(pool: &sqlx::PgPool) {
     for stmt in SCHEMA.split(';') {
         let stmt = stmt.trim();
@@ -115,6 +121,9 @@ async fn postgres_storage_roundtrip() {
         .expect("connect to Postgres");
 
     // Fresh schema each run.
+    // Serialize DB tests: held until the test ends so no other test recreates
+    // the shared schema mid-run.
+    let _db_guard = DB_LOCK.lock().await;
     apply_schema(&pool).await;
 
     let storage = PostgresStorage::new(pool);
@@ -193,6 +202,9 @@ async fn postgres_threads_conversations() {
         .connect(&url)
         .await
         .expect("connect to Postgres");
+    // Serialize DB tests: held until the test ends so no other test recreates
+    // the shared schema mid-run.
+    let _db_guard = DB_LOCK.lock().await;
     apply_schema(&pool).await;
 
     let storage = PostgresStorage::new(pool);

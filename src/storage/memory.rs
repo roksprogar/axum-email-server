@@ -153,7 +153,10 @@ impl Storage for InMemoryStorage {
 
     async fn save_message(&self, message: RawMessage) -> Result<u64, MailError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::SeqCst);
-        let refs = referenced_ids(message.in_reply_to.as_deref(), message.references.as_deref());
+        let refs = referenced_ids(
+            message.in_reply_to.as_deref(),
+            message.references.as_deref(),
+        );
         let subj_norm = normalize_subject(message.subject.as_deref());
 
         let mut records = self
@@ -477,7 +480,10 @@ impl Storage for InMemoryStorage {
         msgs.sort_by(|a, b| a.received_at.cmp(&b.received_at).then(a.id.cmp(&b.id)));
 
         let subject = msgs.first().and_then(|r| r.msg.subject.clone());
-        let address = msgs.last().map(|r| r.msg.address.clone()).unwrap_or_default();
+        let address = msgs
+            .last()
+            .map(|r| r.msg.address.clone())
+            .unwrap_or_default();
         let latest_message_id = msgs.last().map(|r| r.id);
 
         let mut ordered: Vec<(DateTime<Utc>, u8, i64, ThreadItem)> = Vec::new();

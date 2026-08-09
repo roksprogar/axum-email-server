@@ -80,7 +80,10 @@ impl Storage for PostgresStorage {
         })?;
 
         let subject_normalized = normalize_subject(message.subject.as_deref());
-        let refs = referenced_ids(message.in_reply_to.as_deref(), message.references.as_deref());
+        let refs = referenced_ids(
+            message.in_reply_to.as_deref(),
+            message.references.as_deref(),
+        );
 
         // 1) Thread by referenced Message-ID: join the conversation of any known
         //    inbound message *or* one of our sent replies that this references.
