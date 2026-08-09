@@ -1,6 +1,6 @@
 [package]
 name = "axum-email-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A framework-agnostic Rust library for receiving and replying to SMTP mail via a pluggable store."
 license = "MIT"
