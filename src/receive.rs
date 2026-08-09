@@ -198,7 +198,12 @@ where
     // Offer STARTTLS only when we're not already inside TLS and a cert/key exist.
     let tls_available = !already_tls && tls_configured(config);
     let mut stream = BufStream::new(stream);
-    write_reply(&mut stream, 220, "mail ESMTP").await?;
+    // Send the 220 greeting only on the initial connection. After STARTTLS the
+    // client (per RFC 3207) issues a fresh EHLO and expects the 250 capability
+    // reply — re-sending a 220 banner here desyncs the dialogue by one response.
+    if !already_tls {
+        write_reply(&mut stream, 220, &format!("{} ESMTP", config.hostname)).await?;
+    }
 
     let mut helo_domain: Option<String> = None;
     let mut mail_from: Option<String> = None;
@@ -213,11 +218,20 @@ where
 
         let (verb, rest) = split_command(line);
         match verb.to_ascii_uppercase().as_str() {
-            "EHLO" | "HELO" => {
+            "EHLO" => {
                 helo_domain = rest.split_whitespace().next().map(str::to_string);
                 mail_from = None;
                 recipients.clear();
                 write_ehlo(&mut stream, tls_available, config).await?;
+            }
+            "HELO" => {
+                helo_domain = rest.split_whitespace().next().map(str::to_string);
+                mail_from = None;
+                recipients.clear();
+                // RFC 5321 §4.1.1.1: HELO gets a single-line greeting with no
+                // ESMTP extension list — those (SIZE/8BITMIME/STARTTLS) are
+                // EHLO-only. A HELO-only client can mis-parse a multiline reply.
+                write_reply(&mut stream, 250, &config.hostname).await?;
             }
             "STARTTLS" => {
                 if already_tls {
@@ -503,7 +517,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut lines = vec![
-        "250-mail".to_string(),
+        format!("250-{}", config.hostname),
         format!("250-SIZE {}", config.max_message_size_bytes),
         "250-8BITMIME".to_string(),
     ];
@@ -794,5 +808,114 @@ mod tests {
         input.extend_from_slice(b".\r\n");
         let mut stream = stream_of(input).await;
         assert!(read_data(&mut stream, 1000, 5).await.is_err());
+    }
+
+    // ---- session greeting / STARTTLS re-entry (regression for the banner desync) ----
+
+    use crate::sender::{MailSender, OutgoingReply};
+    use crate::storage::InMemoryStorage;
+
+    /// Reply sender that does nothing — the greeting/STARTTLS tests never send.
+    struct NoopSender;
+
+    #[async_trait::async_trait]
+    impl MailSender for NoopSender {
+        async fn send(&self, _reply: OutgoingReply) -> Result<(), MailError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal service for driving `run_session` in-memory. `with_sender` reads
+    /// the system DNS config for the SPF/DKIM authenticator, so this needs a
+    /// readable `/etc/resolv.conf` (present in CI/containers).
+    fn test_service() -> MailService {
+        MailService::with_sender(
+            MailConfig::default(),
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(NoopSender),
+        )
+        .expect("failed to build test MailService (needs a readable /etc/resolv.conf)")
+    }
+
+    #[tokio::test]
+    async fn plain_leg_opens_with_the_220_banner() {
+        // The initial (plaintext) connection greets first, before any command.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let service = test_service();
+        let handle = tokio::spawn(async move { run_session(server, peer, &service, false).await });
+
+        let mut client = BufStream::new(client);
+        let mut greeting = String::new();
+        client.read_line(&mut greeting).await.unwrap();
+        assert!(
+            greeting.starts_with("220"),
+            "initial connection must open with a 220 banner, got {greeting:?}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn starttls_leg_does_not_resend_the_banner() {
+        // After STARTTLS, run_session re-enters with already_tls=true. Per RFC
+        // 3207 it must NOT re-send a 220 banner: it waits for the fresh EHLO and
+        // answers 250. Re-sending 220 desyncs every later reply by one — the bug
+        // this guards against (it broke DATA over TLS).
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let service = test_service();
+        let handle = tokio::spawn(async move { run_session(server, peer, &service, true).await });
+
+        let mut client = BufStream::new(client);
+        // Client speaks first — no unsolicited banner should arrive.
+        client.write_all(b"EHLO test.local\r\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut first = String::new();
+        client.read_line(&mut first).await.unwrap();
+        assert!(
+            first.starts_with("250"),
+            "post-STARTTLS EHLO must be answered with 250 capabilities, got {first:?}"
+        );
+        assert!(
+            !first.starts_with("220"),
+            "server re-sent a 220 banner after STARTTLS — the desync bug, got {first:?}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn helo_gets_a_single_line_reply_without_extensions() {
+        // RFC 5321 §4.1.1.1: HELO must NOT carry the ESMTP extension list
+        // (SIZE/8BITMIME/STARTTLS) — that's EHLO-only. It gets one `250 <host>`
+        // line: a space after the code, not a continuation dash.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let service = test_service();
+        let handle = tokio::spawn(async move { run_session(server, peer, &service, false).await });
+
+        let mut client = BufStream::new(client);
+        let mut greeting = String::new();
+        client.read_line(&mut greeting).await.unwrap(); // consume the 220 banner
+
+        client.write_all(b"HELO test.local\r\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut reply = String::new();
+        client.read_line(&mut reply).await.unwrap();
+        assert!(
+            reply.starts_with("250 ") && !reply.starts_with("250-"),
+            "HELO must get a single-line 250 reply with no extensions, got {reply:?}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = handle.await;
     }
 }
