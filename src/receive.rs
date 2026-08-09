@@ -444,6 +444,16 @@ async fn store_message(
         .as_ref()
         .and_then(|m| m.message_id())
         .map(str::to_string);
+    // Threading headers: In-Reply-To is normally a single Message-ID, References
+    // the full chain. Both feed conversation resolution at persist time.
+    let in_reply_to = parsed
+        .as_ref()
+        .map(|m| m.in_reply_to())
+        .and_then(header_ids_to_string);
+    let references = parsed
+        .as_ref()
+        .map(|m| m.references())
+        .and_then(header_ids_to_string);
     let from_display = parsed
         .as_ref()
         .and_then(|m| m.from())
@@ -469,6 +479,8 @@ async fn store_message(
             envelope_from: from.to_string(),
             envelope_to: rcpt.clone(),
             message_id: message_id.clone(),
+            in_reply_to: in_reply_to.clone(),
+            references: references.clone(),
             from_display: from_display.clone(),
             subject: subject.clone(),
             body_text: body_text.clone(),
@@ -490,6 +502,21 @@ async fn store_message(
         );
     }
     Ok(())
+}
+
+/// Flattens a threading header (`In-Reply-To`/`References`) into a single
+/// space-joined string of Message-IDs, or `None` when empty/absent.
+fn header_ids_to_string(h: &mail_parser::HeaderValue) -> Option<String> {
+    let joined = match h.as_text_list() {
+        Some(list) => list
+            .iter()
+            .map(|s| s.as_ref())
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => h.as_text()?.to_string(),
+    };
+    let joined = joined.trim().to_string();
+    (!joined.is_empty()).then_some(joined)
 }
 
 async fn write_reply<S>(stream: &mut BufStream<S>, code: u16, text: &str) -> Result<(), MailError>

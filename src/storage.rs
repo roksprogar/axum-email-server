@@ -18,6 +18,12 @@ pub struct RawMessage {
     pub envelope_from: String,
     pub envelope_to: String,
     pub message_id: Option<String>,
+    /// `In-Reply-To` header, used to thread this message into an existing
+    /// conversation on ingest.
+    pub in_reply_to: Option<String>,
+    /// `References` header (space-separated Message-IDs), the fuller threading
+    /// chain when present.
+    pub references: Option<String>,
     pub from_display: Option<String>,
     pub subject: Option<String>,
     pub body_text: Option<String>,
@@ -27,6 +33,55 @@ pub struct RawMessage {
     pub spf_result: Option<String>,
     /// "pass"/"fail"/"neutral"/"temperror"/"permerror"/"none".
     pub dkim_result: Option<String>,
+}
+
+/// Strip leading `Re:`/`Fwd:`/`Fw:` prefixes (any number, any case, optional
+/// space before the colon) and trim. Returns `None` when nothing is left, so an
+/// empty normalized subject never becomes a grouping key. Kept in step with the
+/// migration's backfill regex so historical rows normalize the same way.
+pub(crate) fn normalize_subject(subject: Option<&str>) -> Option<String> {
+    let mut s = subject.unwrap_or("").trim();
+    'outer: loop {
+        for kw in ["re", "fwd", "fw"] {
+            if let Some(head) = s.get(..kw.len()) {
+                if head.eq_ignore_ascii_case(kw) {
+                    let rest = s[kw.len()..].trim_start();
+                    if let Some(after) = rest.strip_prefix(':') {
+                        s = after.trim_start();
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    let out = s.trim();
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// Strip surrounding angle brackets + whitespace from a Message-ID so ids
+/// compare equal whether stored bracketed or bare.
+pub(crate) fn normalize_message_id(id: &str) -> String {
+    id.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string()
+}
+
+/// The set of Message-IDs an inbound message references (its `References` chain
+/// plus `In-Reply-To`), normalized and de-duplicated, for conversation lookup.
+pub(crate) fn referenced_ids(in_reply_to: Option<&str>, references: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for raw in [references, in_reply_to].into_iter().flatten() {
+        for tok in raw.split_whitespace() {
+            let n = normalize_message_id(tok);
+            if !n.is_empty() && !ids.contains(&n) {
+                ids.push(n);
+            }
+        }
+    }
+    ids
 }
 
 /// Lightweight row for list views — omits the heavy `body_*`/`raw_mime`
@@ -52,8 +107,12 @@ pub struct MessageSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredMessage {
     pub id: i64,
+    /// The conversation this message belongs to (see [`ConversationSummary`]).
+    pub conversation_id: i64,
     pub address: String,
     pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references: Option<String>,
     pub envelope_from: String,
     pub envelope_to: String,
     pub from_display: Option<String>,
@@ -67,6 +126,57 @@ pub struct StoredMessage {
     pub replied_at: Option<DateTime<Utc>>,
     pub attachments: Vec<Attachment>,
     pub replies: Vec<StoredReply>,
+}
+
+/// One conversation in the grouped inbox: its most recent activity, the latest
+/// inbound participant, and unread/total counts — the row the UI renders in the
+/// conversation list. A conversation groups an inbound message, our replies to
+/// it, and any further inbound replies-to-replies under one `conversation_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationSummary {
+    pub conversation_id: i64,
+    /// The inbox (`local_part@domain`) of the conversation's latest inbound message.
+    pub address: String,
+    /// Subject of the latest inbound message.
+    pub subject: Option<String>,
+    pub last_from_display: Option<String>,
+    pub last_envelope_from: String,
+    /// Total items in the conversation (inbound messages + our replies).
+    pub message_count: i64,
+    /// Inbound messages not yet marked read.
+    pub unread_count: i64,
+    /// Most recent activity — the later of the last inbound receipt and the
+    /// last reply we sent.
+    pub last_activity_at: DateTime<Utc>,
+    pub spf_result: Option<String>,
+    pub dkim_result: Option<String>,
+    /// Whether any reply has been sent in this conversation.
+    pub replied: bool,
+}
+
+/// A conversation as an interleaved, chronological transcript: inbound messages
+/// and our outbound replies ordered by time, for the thread view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationThread {
+    pub conversation_id: i64,
+    /// The inbox the latest inbound message was addressed to (the reply identity).
+    pub address: String,
+    /// The conversation's subject (its earliest message's subject).
+    pub subject: Option<String>,
+    pub items: Vec<ThreadItem>,
+    /// The latest inbound message id — the target the reply endpoint should use
+    /// so a reply threads onto the most recent inbound message.
+    pub latest_message_id: Option<i64>,
+}
+
+/// One entry in a [`ConversationThread`]: either an inbound message (full, with
+/// its attachments) or one of our sent replies. Serializes internally tagged as
+/// `{ "kind": "message", … }` / `{ "kind": "reply", … }`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ThreadItem {
+    Message(Box<StoredMessage>),
+    Reply(StoredReply),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +234,10 @@ pub struct AddressInfo {
 pub struct NewReply {
     /// FK to the `mail_messages.id` being replied to.
     pub message_id: i64,
+    /// The `Message-ID` we stamped on the outbound reply (bare, no angle
+    /// brackets), so a later inbound reply-to-this-reply threads back into the
+    /// conversation. `None` if the reply carried no id.
+    pub rfc_message_id: Option<String>,
     pub sent_by: Option<String>,
     pub body_text: Option<String>,
     pub body_html: Option<String>,
@@ -145,6 +259,29 @@ pub trait Storage: Send + Sync {
     /// List messages newest-first, filtered by `filter`.
     async fn list_messages(&self, filter: &MessageFilter)
         -> Result<Vec<MessageSummary>, MailError>;
+
+    /// List conversations newest-activity-first, filtered by `filter` (matched
+    /// against each conversation's latest inbound message). This is the grouped
+    /// inbox view.
+    async fn list_conversations(
+        &self,
+        filter: &MessageFilter,
+    ) -> Result<Vec<ConversationSummary>, MailError>;
+
+    /// Fetch one conversation as an interleaved transcript of inbound messages
+    /// and our replies, or `None` if the conversation is empty/unknown.
+    async fn get_conversation(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<ConversationThread>, MailError>;
+
+    /// Stamp `read_at = now()` on every unread inbound message in the
+    /// conversation. Idempotent; unknown ids are a no-op.
+    async fn mark_conversation_read(&self, conversation_id: i64) -> Result<(), MailError>;
+
+    /// Permanently delete a whole conversation — every message in it with its
+    /// attachments and replies. Irreversible; an unknown id is a no-op.
+    async fn delete_conversation(&self, conversation_id: i64) -> Result<(), MailError>;
 
     /// Fetch one message with its attachments and replies, or `None` if no
     /// message has that id.

@@ -16,7 +16,10 @@
 
 use crate::errors::MailError;
 use crate::service::MailService;
-use crate::storage::{AddressInfo, MessageFilter, MessageSummary, StoredMessage};
+use crate::storage::{
+    AddressInfo, ConversationSummary, ConversationThread, MessageFilter, MessageSummary,
+    StoredMessage,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -62,6 +65,12 @@ pub fn mail_router() -> Router<MailService> {
         .route("/messages/:id/read", post(mark_read))
         .route("/messages/:id/reply", post(reply))
         .route("/threads/:id", delete(delete_thread))
+        .route("/conversations", get(list_conversations))
+        .route(
+            "/conversations/:id",
+            get(get_conversation).delete(delete_conversation),
+        )
+        .route("/conversations/:id/read", post(mark_conversation_read))
         .route("/addresses", get(list_addresses).post(create_address))
         .route("/addresses/:id", delete(delete_address))
         .route("/addresses/:id/active", post(set_address_active))
@@ -106,6 +115,48 @@ async fn delete_thread(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     service.storage.delete_thread(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_conversations(
+    State(service): State<MailService>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<ConversationSummary>>, ApiError> {
+    let filter = MessageFilter {
+        domain: q.domain,
+        address: q.address,
+        unread_only: q.unread,
+        limit: q.limit,
+        offset: q.offset.unwrap_or(0),
+    };
+    Ok(Json(service.storage.list_conversations(&filter).await?))
+}
+
+async fn get_conversation(
+    State(service): State<MailService>,
+    Path(id): Path<i64>,
+) -> Result<Json<ConversationThread>, ApiError> {
+    service
+        .storage
+        .get_conversation(id)
+        .await?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+async fn mark_conversation_read(
+    State(service): State<MailService>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    service.storage.mark_conversation_read(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_conversation(
+    State(service): State<MailService>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    service.storage.delete_conversation(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

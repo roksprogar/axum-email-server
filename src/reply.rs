@@ -2,6 +2,17 @@ use crate::errors::MailError;
 use crate::sender::OutgoingReply;
 use crate::service::MailService;
 use crate::storage::NewReply;
+use uuid::Uuid;
+
+/// Wrap a Message-ID in angle brackets if it isn't already (header form).
+fn bracket_id(mid: &str) -> String {
+    let t = mid.trim();
+    if t.starts_with('<') && t.ends_with('>') {
+        t.to_string()
+    } else {
+        format!("<{}>", t.trim_start_matches('<').trim_end_matches('>'))
+    }
+}
 
 impl MailService {
     /// Send a reply to a stored message and record the outcome.
@@ -41,21 +52,44 @@ impl MailService {
             None => "Re:".to_string(),
         };
 
-        // Angle-bracket the original Message-ID for the threading headers.
-        let bracketed = original.message_id.as_deref().map(|mid| {
-            if mid.starts_with('<') {
-                mid.to_string()
-            } else {
-                format!("<{mid}>")
+        // In-Reply-To: the original's own Message-ID.
+        let original_bracketed = original.message_id.as_deref().map(bracket_id);
+
+        // References: the original's References chain (if any), then the
+        // original's own Message-ID, so the reply extends the same thread.
+        let mut refs: Vec<String> = Vec::new();
+        if let Some(chain) = original.references.as_deref() {
+            for tok in chain.split_whitespace() {
+                let b = bracket_id(tok);
+                if !refs.contains(&b) {
+                    refs.push(b);
+                }
             }
-        });
+        }
+        if let Some(ref b) = original_bracketed {
+            if !refs.contains(b) {
+                refs.push(b.clone());
+            }
+        }
+        let references = (!refs.is_empty()).then(|| refs.join(" "));
+
+        // Our own Message-ID, stamped on the outbound reply and recorded so a
+        // later inbound reply-to-this-reply threads back into the conversation.
+        let reply_domain = original
+            .address
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .unwrap_or("localhost");
+        let reply_mid_bare = format!("{}@{}", Uuid::new_v4(), reply_domain);
+        let reply_mid_wire = format!("<{reply_mid_bare}>");
 
         let reply = OutgoingReply {
             from: original.address,
             to: original.envelope_from,
             subject,
-            in_reply_to: bracketed.clone(),
-            references: bracketed,
+            message_id: Some(reply_mid_wire),
+            in_reply_to: original_bracketed,
+            references,
             body_text: body_text.clone(),
             body_html: body_html.clone(),
         };
@@ -71,6 +105,7 @@ impl MailService {
             .storage
             .save_reply(NewReply {
                 message_id,
+                rfc_message_id: Some(reply_mid_bare),
                 sent_by,
                 body_text,
                 body_html,
@@ -121,8 +156,11 @@ mod tests {
     fn stored_message() -> StoredMessage {
         StoredMessage {
             id: 1,
+            conversation_id: 1,
             address: "contact@leanhigh.com".to_string(),
             message_id: Some("abc@example.com".to_string()),
+            in_reply_to: None,
+            references: None,
             envelope_from: "someone@example.com".to_string(),
             envelope_to: "contact@leanhigh.com".to_string(),
             from_display: Some("Someone".to_string()),

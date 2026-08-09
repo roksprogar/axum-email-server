@@ -19,8 +19,13 @@ pub struct OutgoingReply {
     pub from: String,
     pub to: String,
     pub subject: String,
+    /// Angle-bracketed `Message-ID` to stamp on this reply, so a later inbound
+    /// reply-to-this-reply can be threaded back. `None` lets the transport
+    /// generate one (but then it can't be recorded for threading).
+    pub message_id: Option<String>,
     /// Angle-bracketed Message-ID of the message being replied to, if any.
     pub in_reply_to: Option<String>,
+    /// Space-joined, angle-bracketed `References` chain for the reply.
     pub references: Option<String>,
     pub body_text: Option<String>,
     pub body_html: Option<String>,
@@ -79,7 +84,11 @@ impl LettreMailSender {
         let mut builder = Message::builder()
             .from(from)
             .to(to)
-            .subject(reply.subject.clone());
+            .subject(reply.subject.clone())
+            // Passed through as-is (already angle-bracketed by the caller); when
+            // None, lettre generates one — but then it isn't recorded, so a
+            // reply-to-this-reply can't be threaded.
+            .message_id(reply.message_id.clone());
         if let Some(mid) = &reply.in_reply_to {
             builder = builder.in_reply_to(mid.clone());
         }

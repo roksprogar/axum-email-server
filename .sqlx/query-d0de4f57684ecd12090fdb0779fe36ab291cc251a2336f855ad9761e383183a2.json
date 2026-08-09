@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM mail_attachments WHERE message_id IN\n                (SELECT id FROM mail_messages WHERE COALESCE(conversation_id, id) = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0de4f57684ecd12090fdb0779fe36ab291cc251a2336f855ad9761e383183a2"
+}

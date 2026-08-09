@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mail_messages SET conversation_id = id WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "96cd43e4ae631f0e99f2fcb616016b1d9f223a82c421a391d0f661c11af17e1d"
+}

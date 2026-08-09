@@ -16,8 +16,9 @@ pub use errors::MailError;
 pub use sender::{LettreMailSender, MailSender, OutgoingReply};
 pub use service::MailService;
 pub use storage::{
-    AddressInfo, Attachment, InMemoryStorage, MessageFilter, MessageSummary, NewReply, RawMessage,
-    Storage, StoredMessage, StoredReply,
+    AddressInfo, Attachment, ConversationSummary, ConversationThread, InMemoryStorage,
+    MessageFilter, MessageSummary, NewReply, RawMessage, Storage, StoredMessage, StoredReply,
+    ThreadItem,
 };
 
 #[cfg(feature = "postgres")]

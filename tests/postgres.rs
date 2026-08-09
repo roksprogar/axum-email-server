@@ -6,8 +6,21 @@
 //! but the consumer owns the migration.
 #![cfg(feature = "postgres")]
 
-use axum_email_server::{MessageFilter, PostgresStorage, RawMessage, Storage};
+use axum_email_server::{MessageFilter, NewReply, PostgresStorage, RawMessage, Storage};
 use sqlx::postgres::PgPoolOptions;
+
+async fn apply_schema(pool: &sqlx::PgPool) {
+    for stmt in SCHEMA.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt)
+            .execute(pool)
+            .await
+            .expect("apply schema statement");
+    }
+}
 
 const SCHEMA: &str = r#"
 DROP TABLE IF EXISTS mail_replies CASCADE;
@@ -31,21 +44,25 @@ CREATE TABLE mail_addresses (
     UNIQUE (domain_id, local_part)
 );
 CREATE TABLE mail_messages (
-    id             BIGSERIAL PRIMARY KEY,
-    address_id     BIGINT NOT NULL REFERENCES mail_addresses(id),
-    message_id     TEXT,
-    envelope_from  TEXT NOT NULL,
-    envelope_to    TEXT NOT NULL,
-    from_display   TEXT,
-    subject        TEXT,
-    body_text      TEXT,
-    body_html      TEXT,
-    raw_mime       BYTEA NOT NULL,
-    spf_result     TEXT,
-    dkim_result    TEXT,
-    received_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    read_at        TIMESTAMPTZ,
-    replied_at     TIMESTAMPTZ
+    id                 BIGSERIAL PRIMARY KEY,
+    address_id         BIGINT NOT NULL REFERENCES mail_addresses(id),
+    message_id         TEXT,
+    in_reply_to        TEXT,
+    references_header  TEXT,
+    subject_normalized TEXT,
+    conversation_id    BIGINT,
+    envelope_from      TEXT NOT NULL,
+    envelope_to        TEXT NOT NULL,
+    from_display       TEXT,
+    subject            TEXT,
+    body_text          TEXT,
+    body_html          TEXT,
+    raw_mime           BYTEA NOT NULL,
+    spf_result         TEXT,
+    dkim_result        TEXT,
+    received_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    read_at            TIMESTAMPTZ,
+    replied_at         TIMESTAMPTZ
 );
 CREATE TABLE mail_attachments (
     id            BIGSERIAL PRIMARY KEY,
@@ -58,6 +75,7 @@ CREATE TABLE mail_attachments (
 CREATE TABLE mail_replies (
     id               BIGSERIAL PRIMARY KEY,
     message_id       BIGINT NOT NULL REFERENCES mail_messages(id),
+    rfc_message_id   TEXT,
     sent_by          TEXT,
     body_text        TEXT,
     body_html        TEXT,
@@ -72,6 +90,8 @@ fn sample_message() -> RawMessage {
         envelope_from: "someone@example.com".to_string(),
         envelope_to: "contact@leanhigh.com".to_string(),
         message_id: Some("mid-1@example.com".to_string()),
+        in_reply_to: None,
+        references: None,
         from_display: Some("Someone".to_string()),
         subject: Some("Hi".to_string()),
         body_text: Some("hello".to_string()),
@@ -95,16 +115,7 @@ async fn postgres_storage_roundtrip() {
         .expect("connect to Postgres");
 
     // Fresh schema each run.
-    for stmt in SCHEMA.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
-        }
-        sqlx::query(stmt)
-            .execute(&pool)
-            .await
-            .expect("apply schema statement");
-    }
+    apply_schema(&pool).await;
 
     let storage = PostgresStorage::new(pool);
 
@@ -169,4 +180,95 @@ async fn postgres_storage_roundtrip() {
     // Permanent thread delete.
     storage.delete_thread(id).await.unwrap();
     assert!(storage.get_message(id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn postgres_threads_conversations() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("DATABASE_URL not set — skipping Postgres threading test");
+        return;
+    };
+
+    let pool = PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .expect("connect to Postgres");
+    apply_schema(&pool).await;
+
+    let storage = PostgresStorage::new(pool);
+    storage
+        .create_address("contact", "leanhigh.com", None)
+        .await
+        .unwrap();
+
+    // Inbound A → new conversation.
+    let a = storage
+        .save_message(RawMessage {
+            message_id: Some("m1@example.com".to_string()),
+            subject: Some("Hello".to_string()),
+            ..sample_message()
+        })
+        .await
+        .unwrap() as i64;
+
+    // Our reply to A, stamped with Message-ID r1.
+    storage
+        .save_reply(NewReply {
+            message_id: a,
+            rfc_message_id: Some("r1@leanhigh.com".to_string()),
+            sent_by: Some("op@leanhigh.com".to_string()),
+            body_text: Some("hi".to_string()),
+            body_html: None,
+            delivery_status: "sent".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Inbound B references our reply r1 → same conversation.
+    let b = storage
+        .save_message(RawMessage {
+            message_id: Some("m2@example.com".to_string()),
+            in_reply_to: Some("<r1@leanhigh.com>".to_string()),
+            subject: Some("Re: Hello".to_string()),
+            ..sample_message()
+        })
+        .await
+        .unwrap() as i64;
+
+    let convs = storage
+        .list_conversations(&MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(convs.len(), 1, "A, our reply, and B group into one row");
+    let conv_id = convs[0].conversation_id;
+    assert_eq!(convs[0].message_count, 3);
+    assert_eq!(convs[0].unread_count, 2);
+    assert!(convs[0].replied);
+
+    let thread = storage
+        .get_conversation(conv_id)
+        .await
+        .unwrap()
+        .expect("thread exists");
+    assert_eq!(thread.items.len(), 3);
+    assert_eq!(thread.latest_message_id, Some(b));
+    assert_ne!(a, b);
+
+    // Marking the conversation read clears the unread count.
+    storage.mark_conversation_read(conv_id).await.unwrap();
+    let convs = storage
+        .list_conversations(&MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(convs[0].unread_count, 0);
+
+    // Deleting the conversation removes every message in it.
+    storage.delete_conversation(conv_id).await.unwrap();
+    assert!(storage
+        .list_conversations(&MessageFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(storage.get_message(a).await.unwrap().is_none());
+    assert!(storage.get_message(b).await.unwrap().is_none());
 }

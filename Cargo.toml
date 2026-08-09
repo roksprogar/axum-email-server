@@ -1,6 +1,6 @@
 [package]
 name = "axum-email-server"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A framework-agnostic Rust library for receiving and replying to SMTP mail via a pluggable store."
 license = "MIT"
@@ -23,6 +23,7 @@ mail-auth = "0.11"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+uuid = { version = "1", features = ["v4"] }
 
 # Optional Axum support
 axum = { version = "0.7", optional = true }

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM mail_messages WHERE COALESCE(conversation_id, id) = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8058ac8b28b5dc6c638f62242943ad814ea0d62a14326e2ce40b3105d7de3419"
+}
