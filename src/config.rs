@@ -39,6 +39,37 @@ pub struct MailConfig {
     pub max_recipients_per_message: usize,
     /// Max new connections accepted per remote IP per minute (0 = unlimited).
     pub max_connections_per_ip_per_minute: u32,
+
+    // --- Spam / abuse filtering. All opt-in: the defaults below preserve the
+    // pre-filtering behavior (accept + label), so enabling any of these is a
+    // deliberate config choice. None of them load models or hold significant
+    // state — the cost is at most a cached DNS lookup or a small in-memory map.
+    /// DNSBL zones queried against the connecting IP, e.g.
+    /// ["zen.spamhaus.org"]. A connection whose IP is listed in ANY zone is
+    /// refused at greeting time with a 554. Empty disables DNSBL.
+    pub dnsbl_zones: Vec<String>,
+
+    /// Reject at `MAIL FROM` when SPF hard-fails — the sender domain publishes
+    /// `-all` and this IP isn't authorized. SoftFail/Neutral/None/errors are
+    /// never rejected on this alone. Default false (SPF result is only
+    /// recorded, as before).
+    pub reject_on_spf_fail: bool,
+
+    /// Honor the sender domain's published DMARC policy: when it is `p=reject`
+    /// and the message fails DMARC (neither SPF nor DKIM aligns), reject at
+    /// DATA. `p=quarantine`/`p=none` are never rejected. Default false.
+    pub enforce_dmarc: bool,
+
+    /// Reject `HELO`/`EHLO` whose argument is syntactically invalid (absent, a
+    /// bare IP without brackets, or not domain-shaped). Pure string checks, no
+    /// DNS. Default false.
+    pub reject_invalid_helo: bool,
+
+    /// Greylisting delay in seconds: the first delivery attempt from an unseen
+    /// (IP, MAIL FROM, RCPT) triplet is temp-rejected with 451, and admitted
+    /// once the sender retries after this delay. In-memory (resets on restart).
+    /// 0 disables greylisting. Default 0.
+    pub greylist_delay_seconds: u64,
 }
 
 impl Default for MailConfig {
@@ -60,8 +91,22 @@ impl Default for MailConfig {
             session_timeout_seconds: 300,
             max_recipients_per_message: 10,
             max_connections_per_ip_per_minute: 60,
+            dnsbl_zones: Vec::new(),
+            reject_on_spf_fail: false,
+            enforce_dmarc: false,
+            reject_invalid_helo: false,
+            greylist_delay_seconds: 0,
         }
     }
+}
+
+/// Parses a boolean env value leniently: `1`/`true`/`yes`/`on` (any case) are
+/// true, everything else false.
+fn env_bool(val: &str) -> bool {
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 impl MailConfig {
@@ -144,6 +189,32 @@ impl MailConfig {
         if let Ok(val) = std::env::var("MAX_CONNECTIONS_PER_IP_PER_MINUTE") {
             config.max_connections_per_ip_per_minute = val.parse().map_err(|_| {
                 MailError::ConfigError("Invalid MAX_CONNECTIONS_PER_IP_PER_MINUTE".to_string())
+            })?;
+        }
+
+        // Spam / abuse filtering (all optional; absent env vars keep the
+        // defaults above).
+        if let Ok(val) = std::env::var("DNSBL_ZONES") {
+            // Comma- or whitespace-separated list of DNSBL zones.
+            config.dnsbl_zones = val
+                .split([',', ' ', '\t'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(val) = std::env::var("REJECT_ON_SPF_FAIL") {
+            config.reject_on_spf_fail = env_bool(&val);
+        }
+        if let Ok(val) = std::env::var("ENFORCE_DMARC") {
+            config.enforce_dmarc = env_bool(&val);
+        }
+        if let Ok(val) = std::env::var("REJECT_INVALID_HELO") {
+            config.reject_invalid_helo = env_bool(&val);
+        }
+        if let Ok(val) = std::env::var("GREYLIST_DELAY_SECONDS") {
+            config.greylist_delay_seconds = val.parse().map_err(|_| {
+                MailError::ConfigError("Invalid GREYLIST_DELAY_SECONDS".to_string())
             })?;
         }
 

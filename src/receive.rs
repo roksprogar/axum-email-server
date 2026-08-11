@@ -2,8 +2,13 @@ use crate::config::MailConfig;
 use crate::errors::MailError;
 use crate::service::MailService;
 use crate::storage::{RawMessage, Storage};
+use mail_auth::dmarc::verify::DmarcParameters;
+use mail_auth::dmarc::Policy;
 use mail_auth::spf::verify::SpfParameters;
-use mail_auth::{AuthenticatedMessage, DkimOutput, DkimResult, MessageAuthenticator, SpfResult};
+use mail_auth::{
+    AuthenticatedMessage, DkimOutput, DkimResult, DmarcResult, MessageAuthenticator, SpfOutput,
+    SpfResult,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -198,6 +203,29 @@ where
     // Offer STARTTLS only when we're not already inside TLS and a cert/key exist.
     let tls_available = !already_tls && tls_configured(config);
     let mut stream = BufStream::new(stream);
+
+    // Refuse DNSBL-listed clients before greeting — one cached DNS lookup per
+    // zone. Only on the initial (plaintext) leg: the post-STARTTLS re-entry is
+    // the same peer we already cleared here.
+    if !already_tls && !config.dnsbl_zones.is_empty() {
+        if let Some(zone) =
+            crate::filter::dnsbl_listed(&service.authenticator, peer_addr.ip(), &config.dnsbl_zones)
+                .await
+        {
+            tracing::info!("rejecting {} — listed on DNSBL {}", peer_addr, zone);
+            write_reply(
+                &mut stream,
+                554,
+                &format!(
+                    "5.7.1 Service unavailable; client [{}] blocked",
+                    peer_addr.ip()
+                ),
+            )
+            .await?;
+            return Ok(LoopResult::Closed);
+        }
+    }
+
     // Send the 220 greeting only on the initial connection. After STARTTLS the
     // client (per RFC 3207) issues a fresh EHLO and expects the 250 capability
     // reply — re-sending a 220 banner here desyncs the dialogue by one response.
@@ -208,6 +236,9 @@ where
     let mut helo_domain: Option<String> = None;
     let mut mail_from: Option<String> = None;
     let mut recipients: Vec<String> = Vec::new();
+    // SPF is computed at MAIL FROM (all its inputs are known there) and reused
+    // for DMARC at DATA. Reset whenever the transaction/sender resets.
+    let mut spf_output: Option<SpfOutput> = None;
 
     loop {
         let line = read_line_timeout(&mut stream, config.command_timeout_seconds).await?;
@@ -219,15 +250,41 @@ where
         let (verb, rest) = split_command(line);
         match verb.to_ascii_uppercase().as_str() {
             "EHLO" => {
-                helo_domain = rest.split_whitespace().next().map(str::to_string);
+                let domain = rest.split_whitespace().next();
+                if config.reject_invalid_helo
+                    && !domain.map(crate::filter::valid_helo).unwrap_or(false)
+                {
+                    write_reply(
+                        &mut stream,
+                        550,
+                        "5.7.1 Helo command rejected: invalid hostname",
+                    )
+                    .await?;
+                    continue;
+                }
+                helo_domain = domain.map(str::to_string);
                 mail_from = None;
                 recipients.clear();
+                spf_output = None;
                 write_ehlo(&mut stream, tls_available, config).await?;
             }
             "HELO" => {
-                helo_domain = rest.split_whitespace().next().map(str::to_string);
+                let domain = rest.split_whitespace().next();
+                if config.reject_invalid_helo
+                    && !domain.map(crate::filter::valid_helo).unwrap_or(false)
+                {
+                    write_reply(
+                        &mut stream,
+                        550,
+                        "5.7.1 Helo command rejected: invalid hostname",
+                    )
+                    .await?;
+                    continue;
+                }
+                helo_domain = domain.map(str::to_string);
                 mail_from = None;
                 recipients.clear();
+                spf_output = None;
                 // RFC 5321 §4.1.1.1: HELO gets a single-line greeting with no
                 // ESMTP extension list — those (SIZE/8BITMIME/STARTTLS) are
                 // EHLO-only. A HELO-only client can mis-parse a multiline reply.
@@ -257,6 +314,36 @@ where
             }
             "MAIL" => match extract_address(rest, "FROM:") {
                 Some(addr) => {
+                    // Run SPF now — IP, HELO and MAIL FROM are all known — so a
+                    // hard fail can be refused before we accept the body, and
+                    // the result feeds DMARC at DATA. The null sender (`<>`)
+                    // used by bounces has no domain to check, so it's unscored.
+                    let spf = if addr.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            run_spf(
+                                &service.authenticator,
+                                peer_addr.ip(),
+                                helo_domain.as_deref().unwrap_or(""),
+                                &config.hostname,
+                                &addr,
+                            )
+                            .await,
+                        )
+                    };
+                    if config.reject_on_spf_fail
+                        && matches!(spf.as_ref().map(SpfOutput::result), Some(SpfResult::Fail))
+                    {
+                        tracing::info!(
+                            "rejecting MAIL FROM <{}> from {} — SPF fail",
+                            addr,
+                            peer_addr
+                        );
+                        write_reply(&mut stream, 550, "5.7.1 SPF validation failed").await?;
+                        continue;
+                    }
+                    spf_output = spf;
                     mail_from = Some(addr);
                     recipients.clear();
                     write_reply(&mut stream, 250, "OK").await?;
@@ -272,16 +359,33 @@ where
                     Some(addr) => {
                         if recipients.len() >= config.max_recipients_per_message {
                             write_reply(&mut stream, 452, "Too many recipients").await?;
-                        } else if service
+                        } else if !service
                             .storage
                             .is_valid_recipient(&addr)
                             .await
                             .unwrap_or(false)
                         {
+                            write_reply(&mut stream, 550, "No such user here").await?;
+                        } else if !service.greylist.admit(
+                            peer_addr.ip(),
+                            mail_from.as_deref().unwrap_or(""),
+                            &addr,
+                        ) {
+                            // First contact for this (IP, sender, rcpt) triplet:
+                            // temp-reject; a legitimate MTA retries after the
+                            // delay and is then admitted. No-op when greylisting
+                            // is disabled (delay 0 admits everything).
+                            tracing::info!(
+                                "greylisting {} -> {} from {}",
+                                mail_from.as_deref().unwrap_or("<>"),
+                                addr,
+                                peer_addr
+                            );
+                            write_reply(&mut stream, 451, "4.7.1 Greylisted, please retry shortly")
+                                .await?;
+                        } else {
                             recipients.push(addr);
                             write_reply(&mut stream, 250, "OK").await?;
-                        } else {
-                            write_reply(&mut stream, 550, "No such user here").await?;
                         }
                     }
                     None => write_reply(&mut stream, 501, "Syntax error in parameters").await?,
@@ -302,37 +406,44 @@ where
                 {
                     Ok(raw) => {
                         let sender = mail_from.as_deref().unwrap();
-                        let (spf_result, dkim_result) = verify_message(
+                        let outcome = evaluate_message(
                             &service.authenticator,
-                            peer_addr.ip(),
-                            helo_domain.as_deref().unwrap_or(""),
-                            &config.hostname,
+                            spf_output.as_ref(),
                             sender,
                             &raw,
+                            config.enforce_dmarc,
                         )
                         .await;
-                        match store_message(
-                            &raw,
-                            sender,
-                            &recipients,
-                            spf_result,
-                            dkim_result,
-                            &service.storage,
-                        )
-                        .await
-                        {
-                            Ok(()) => write_reply(&mut stream, 250, "Message accepted").await?,
-                            // Do NOT ACK mail we failed to persist: a 250 here
-                            // would tell the sending MTA the message is safely
-                            // ours and stop it retrying, silently losing it.
-                            // Reply with a transient error so it requeues.
-                            Err(_) => {
-                                write_reply(
-                                    &mut stream,
-                                    451,
-                                    "4.3.0 Temporary storage failure, try again later",
-                                )
-                                .await?
+                        if outcome.dmarc_reject {
+                            tracing::info!(
+                                "rejecting message from {} — DMARC p=reject and unaligned",
+                                sender
+                            );
+                            write_reply(&mut stream, 550, "5.7.1 DMARC policy rejection").await?;
+                        } else {
+                            match store_message(
+                                &raw,
+                                sender,
+                                &recipients,
+                                outcome.spf_result,
+                                outcome.dkim_result,
+                                &service.storage,
+                            )
+                            .await
+                            {
+                                Ok(()) => write_reply(&mut stream, 250, "Message accepted").await?,
+                                // Do NOT ACK mail we failed to persist: a 250
+                                // here would tell the sending MTA the message is
+                                // safely ours and stop it retrying, silently
+                                // losing it. Reply transient so it requeues.
+                                Err(_) => {
+                                    write_reply(
+                                        &mut stream,
+                                        451,
+                                        "4.3.0 Temporary storage failure, try again later",
+                                    )
+                                    .await?
+                                }
                             }
                         }
                     }
@@ -344,10 +455,12 @@ where
                 }
                 mail_from = None;
                 recipients.clear();
+                spf_output = None;
             }
             "RSET" => {
                 mail_from = None;
                 recipients.clear();
+                spf_output = None;
                 write_reply(&mut stream, 250, "OK").await?;
             }
             "NOOP" => write_reply(&mut stream, 250, "OK").await?,
@@ -360,30 +473,88 @@ where
     }
 }
 
-/// Runs SPF (against the connecting IP + `MAIL FROM` domain) and DKIM
-/// (against the message content) verification, returning normalized
-/// `spf_result`/`dkim_result` strings for storage.
-async fn verify_message(
+/// Runs SPF against the connecting IP, HELO identity and `MAIL FROM` sender.
+async fn run_spf(
     authenticator: &MessageAuthenticator,
     peer_ip: IpAddr,
     helo_domain: &str,
     hostname: &str,
     mail_from: &str,
-    raw: &[u8],
-) -> (String, String) {
-    let spf_params = SpfParameters::verify_mail_from(peer_ip, helo_domain, hostname, mail_from);
-    let spf_result =
-        spf_result_str(authenticator.verify_spf(spf_params).await.result()).to_string();
+) -> SpfOutput {
+    let params = SpfParameters::verify_mail_from(peer_ip, helo_domain, hostname, mail_from);
+    authenticator.verify_spf(params).await
+}
 
-    let dkim_result = match AuthenticatedMessage::parse(raw) {
-        Some(auth_message) => {
-            let outputs = authenticator.verify_dkim(&auth_message).await;
-            summarize_dkim(&outputs).to_string()
-        }
-        None => "none".to_string(),
+/// Outcome of authenticating a received message: the normalized SPF/DKIM
+/// strings to persist, and whether DMARC says to reject it.
+struct MessageOutcome {
+    spf_result: String,
+    dkim_result: String,
+    dmarc_reject: bool,
+}
+
+/// Verifies DKIM over the message body and evaluates DMARC alignment against the
+/// SPF result already computed at `MAIL FROM`. `dmarc_reject` is set only when
+/// `enforce_dmarc` is on, the From domain publishes `p=reject`, and neither SPF
+/// nor DKIM aligns. DMARC is skipped when there is no SPF output (null sender).
+async fn evaluate_message(
+    authenticator: &MessageAuthenticator,
+    spf_output: Option<&SpfOutput>,
+    mail_from: &str,
+    raw: &[u8],
+    enforce_dmarc: bool,
+) -> MessageOutcome {
+    let spf_result = spf_output
+        .map(|s| spf_result_str(s.result()))
+        .unwrap_or("none")
+        .to_string();
+
+    let Some(auth_message) = AuthenticatedMessage::parse(raw) else {
+        return MessageOutcome {
+            spf_result,
+            dkim_result: "none".to_string(),
+            dmarc_reject: false,
+        };
     };
 
-    (spf_result, dkim_result)
+    let dkim_outputs = authenticator.verify_dkim(&auth_message).await;
+    let dkim_result = summarize_dkim(&dkim_outputs).to_string();
+
+    let mut dmarc_reject = false;
+    if let Some(spf) = spf_output {
+        let dmarc = authenticator
+            .verify_dmarc(DmarcParameters {
+                message: &auth_message,
+                dkim_output: &dkim_outputs,
+                dkim2_output: None,
+                rfc5321_mail_from_domain: domain_of(mail_from),
+                spf_output: spf,
+            })
+            .await;
+        // DMARC passes if either identifier aligns and verifies.
+        let aligned = matches!(dmarc.dkim_result(), DmarcResult::Pass)
+            || matches!(dmarc.spf_result(), DmarcResult::Pass);
+        if enforce_dmarc && !aligned && matches!(dmarc.policy(), Policy::Reject) {
+            dmarc_reject = true;
+        }
+        tracing::debug!(
+            "DMARC for {}: policy={:?} aligned={}",
+            domain_of(mail_from),
+            dmarc.policy(),
+            aligned
+        );
+    }
+
+    MessageOutcome {
+        spf_result,
+        dkim_result,
+        dmarc_reject,
+    }
+}
+
+/// Domain part of an address (`user@domain` -> `domain`), or "" if absent.
+fn domain_of(addr: &str) -> &str {
+    addr.rsplit_once('@').map(|(_, d)| d).unwrap_or("")
 }
 
 fn spf_result_str(result: SpfResult) -> &'static str {
@@ -939,6 +1110,111 @@ mod tests {
         assert!(
             reply.starts_with("250 ") && !reply.starts_with("250-"),
             "HELO must get a single-line 250 reply with no extensions, got {reply:?}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = handle.await;
+    }
+
+    // ---- spam / abuse filtering ----
+
+    /// Builds a `MailService` with a custom config and storage for driving the
+    /// filter paths. Like `test_service`, this reads the system DNS config.
+    fn filter_service(config: MailConfig, storage: Arc<InMemoryStorage>) -> MailService {
+        MailService::with_sender(config, storage, Arc::new(NoopSender))
+            .expect("failed to build test MailService (needs a readable /etc/resolv.conf)")
+    }
+
+    #[tokio::test]
+    async fn invalid_helo_is_rejected_when_enabled() {
+        // With reject_invalid_helo on, a bare IP (no brackets) is a 550; a
+        // proper domain still gets the normal single-line HELO 250.
+        let config = MailConfig {
+            reject_invalid_helo: true,
+            ..Default::default()
+        };
+        let service = filter_service(config, Arc::new(InMemoryStorage::new()));
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let handle = tokio::spawn(async move { run_session(server, peer, &service, false).await });
+
+        let mut client = BufStream::new(client);
+        let mut line = String::new();
+        client.read_line(&mut line).await.unwrap(); // 220 banner
+
+        client.write_all(b"HELO 192.0.2.1\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        line.clear();
+        client.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("550"),
+            "bare-IP HELO must be 550, got {line:?}"
+        );
+
+        client
+            .write_all(b"HELO mail.example.com\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        line.clear();
+        client.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("250"),
+            "valid HELO must be 250, got {line:?}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn greylist_defers_first_contact() {
+        // A long delay means the first attempt for a triplet is always
+        // deferred. The null sender (<>) is used so the MAIL step doesn't do a
+        // live SPF DNS lookup — greylisting is what's under test here.
+        let config = MailConfig {
+            greylist_delay_seconds: 3600,
+            ..Default::default()
+        };
+        let storage = Arc::new(InMemoryStorage::new().with_addresses(["me@here.test"]));
+        let service = filter_service(config, storage);
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let handle = tokio::spawn(async move { run_session(server, peer, &service, false).await });
+
+        let mut client = BufStream::new(client);
+        let mut line = String::new();
+        client.read_line(&mut line).await.unwrap(); // 220 banner
+
+        client
+            .write_all(b"HELO mail.example.com\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        line.clear();
+        client.read_line(&mut line).await.unwrap(); // 250
+
+        client.write_all(b"MAIL FROM:<>\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        line.clear();
+        client.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("250"),
+            "null-sender MAIL must be 250, got {line:?}"
+        );
+
+        client
+            .write_all(b"RCPT TO:<me@here.test>\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        line.clear();
+        client.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("451"),
+            "first contact for a triplet must be greylisted (451), got {line:?}"
         );
 
         client.write_all(b"QUIT\r\n").await.unwrap();

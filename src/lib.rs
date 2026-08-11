@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod errors;
+pub mod filter;
 pub mod receive;
 pub mod reply;
 pub mod sender;
