@@ -12,9 +12,9 @@ pub mod storage;
 #[cfg(feature = "axum")]
 pub mod axum_api;
 
-pub use config::{MailConfig, StorageType};
+pub use config::{EmailProvider, MailConfig, StorageType};
 pub use errors::MailError;
-pub use sender::{LettreMailSender, MailSender, OutgoingReply};
+pub use sender::{BrevoMailSender, LettreMailSender, MailSender, OutgoingReply};
 pub use service::MailService;
 pub use storage::{
     AddressInfo, Attachment, ConversationSummary, ConversationThread, InMemoryStorage,

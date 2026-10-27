@@ -6,6 +6,16 @@ pub enum StorageType {
     Postgres,
 }
 
+/// How replies are delivered. Read from the same `EMAIL_PROVIDER` /
+/// `BREVO_API_KEY` env vars as `axum-email-otp-auth`, so one setting switches both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EmailProvider {
+    /// SMTP relay (`SMTP_RELAY_*`), e.g. a local mailpit.
+    Smtp,
+    /// Brevo's HTTPS API — works on hosts that block outbound SMTP ports.
+    Brevo,
+}
+
 #[derive(Debug, Clone)]
 pub struct MailConfig {
     /// Which `Storage` backend the consuming app should construct.
@@ -25,7 +35,12 @@ pub struct MailConfig {
     pub tls_cert_path: String,
     pub tls_key_path: String,
 
-    /// Relay used to send replies.
+    /// Transport used to send replies.
+    pub email_provider: EmailProvider,
+    /// Required when `email_provider` is `Brevo`.
+    pub brevo_api_key: Option<String>,
+
+    /// Relay used to send replies when `email_provider` is `Smtp`.
     pub smtp_relay_host: String,
     pub smtp_relay_port: u16,
     pub smtp_relay_username: String,
@@ -81,6 +96,8 @@ impl Default for MailConfig {
             hostname: "mail.example.com".to_string(),
             tls_cert_path: "/etc/mail/certs/fullchain.pem".to_string(),
             tls_key_path: "/etc/mail/certs/privkey.pem".to_string(),
+            email_provider: EmailProvider::Smtp,
+            brevo_api_key: None,
             smtp_relay_host: "localhost".to_string(),
             smtp_relay_port: 587,
             smtp_relay_username: "".to_string(),
@@ -146,6 +163,25 @@ impl MailConfig {
         }
         if let Ok(val) = std::env::var("TLS_KEY_PATH") {
             config.tls_key_path = val;
+        }
+        if let Ok(val) = std::env::var("EMAIL_PROVIDER") {
+            config.email_provider = match val.to_lowercase().as_str() {
+                "smtp" => EmailProvider::Smtp,
+                "brevo" => EmailProvider::Brevo,
+                _ => {
+                    return Err(MailError::ConfigError(
+                        "Invalid EMAIL_PROVIDER: must be 'smtp' or 'brevo'".to_string(),
+                    ))
+                }
+            };
+        }
+        if let Ok(val) = std::env::var("BREVO_API_KEY") {
+            config.brevo_api_key = Some(val);
+        }
+        if config.email_provider == EmailProvider::Brevo && config.brevo_api_key.is_none() {
+            return Err(MailError::ConfigError(
+                "BREVO_API_KEY must be set when EMAIL_PROVIDER is 'brevo'".to_string(),
+            ));
         }
         if let Ok(val) = std::env::var("SMTP_RELAY_HOST") {
             config.smtp_relay_host = val;

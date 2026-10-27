@@ -1,7 +1,8 @@
 //! Pluggable reply delivery. The core `send_reply` flow builds an
 //! [`OutgoingReply`] and hands it to a [`MailSender`], so the transport is a
-//! seam: the default [`LettreMailSender`] speaks SMTP to your relay, while a
-//! test double can record replies without a live server. Mirrors
+//! seam: [`LettreMailSender`] speaks SMTP to your relay, [`BrevoMailSender`]
+//! uses Brevo's HTTPS API, and a test double can record replies without a live
+//! server. Mirrors
 //! `axum-email-otp-auth`'s `EmailSender` abstraction.
 
 use crate::config::MailConfig;
@@ -120,6 +121,92 @@ impl MailSender for LettreMailSender {
             .send(email)
             .await
             .map_err(|e| MailError::ReplyError(format!("SMTP send failed: {e}")))?;
+        Ok(())
+    }
+}
+
+/// [`MailSender`] that delivers through Brevo's HTTPS API (port 443), for hosts
+/// that block outbound SMTP. Threading headers are passed as custom headers.
+pub struct BrevoMailSender {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl BrevoMailSender {
+    pub fn from_config(config: &MailConfig) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to build HTTP client for Brevo"),
+            api_key: config.brevo_api_key.clone().unwrap_or_default(),
+        }
+    }
+
+    fn contact(raw: &str, role: &str) -> Result<serde_json::Value, MailError> {
+        let mailbox: Mailbox = raw
+            .parse()
+            .map_err(|e| MailError::ReplyError(format!("invalid {role} address {raw}: {e}")))?;
+        let mut contact = serde_json::json!({ "email": mailbox.email.to_string() });
+        if let Some(name) = mailbox.name {
+            contact["name"] = serde_json::json!(name);
+        }
+        Ok(contact)
+    }
+}
+
+#[async_trait]
+impl MailSender for BrevoMailSender {
+    async fn send(&self, reply: OutgoingReply) -> Result<(), MailError> {
+        if reply.body_text.is_none() && reply.body_html.is_none() {
+            return Err(MailError::ReplyError(
+                "reply must have a text or html body".to_string(),
+            ));
+        }
+
+        let mut headers = serde_json::Map::new();
+        if let Some(mid) = &reply.message_id {
+            headers.insert("Message-ID".to_string(), serde_json::json!(mid));
+        }
+        if let Some(mid) = &reply.in_reply_to {
+            headers.insert("In-Reply-To".to_string(), serde_json::json!(mid));
+        }
+        if let Some(refs) = &reply.references {
+            headers.insert("References".to_string(), serde_json::json!(refs));
+        }
+
+        let mut payload = serde_json::json!({
+            "sender": Self::contact(&reply.from, "from")?,
+            "to": [Self::contact(&reply.to, "recipient")?],
+            "subject": reply.subject,
+        });
+        if let Some(text) = &reply.body_text {
+            payload["textContent"] = serde_json::json!(text);
+        }
+        if let Some(html) = &reply.body_html {
+            payload["htmlContent"] = serde_json::json!(html);
+        }
+        if !headers.is_empty() {
+            payload["headers"] = serde_json::Value::Object(headers);
+        }
+
+        let response = self
+            .client
+            .post("https://api.brevo.com/v3/smtp/email")
+            .header("api-key", &self.api_key)
+            .header("content-type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .map_err(|e| MailError::ReplyError(format!("Brevo send failed: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(MailError::ReplyError(format!(
+                "Brevo API error: {status} - {error_text}"
+            )));
+        }
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
-use crate::config::MailConfig;
+use crate::config::{EmailProvider, MailConfig};
 use crate::errors::MailError;
 use crate::filter::Greylist;
-use crate::sender::{LettreMailSender, MailSender};
+use crate::sender::{BrevoMailSender, LettreMailSender, MailSender};
 use crate::storage::Storage;
 use mail_auth::MessageAuthenticator;
 use std::sync::Arc;
@@ -21,12 +21,15 @@ pub struct MailService {
 }
 
 impl MailService {
-    /// Uses the default [`LettreMailSender`] built from `config` for reply
-    /// delivery. Fails only if the system DNS resolver config
+    /// Uses the reply sender selected by `config.email_provider`
+    /// ([`LettreMailSender`] or [`BrevoMailSender`]). Fails only if the system DNS resolver config
     /// (`/etc/resolv.conf`) can't be read — SPF/DKIM verification needs it to
     /// look up DNS records.
     pub fn new(config: MailConfig, storage: Arc<dyn Storage>) -> Result<Self, MailError> {
-        let sender = Arc::new(LettreMailSender::from_config(&config));
+        let sender: Arc<dyn MailSender> = match config.email_provider {
+            EmailProvider::Smtp => Arc::new(LettreMailSender::from_config(&config)),
+            EmailProvider::Brevo => Arc::new(BrevoMailSender::from_config(&config)),
+        };
         Self::with_sender(config, storage, sender)
     }
 
