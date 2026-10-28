@@ -212,7 +212,11 @@ where
             crate::filter::dnsbl_listed(&service.authenticator, peer_addr.ip(), &config.dnsbl_zones)
                 .await
         {
-            tracing::info!("rejecting {} — listed on DNSBL {}", peer_addr, zone);
+            tracing::info!(
+                "rejecting {} — listed on DNSBL {}",
+                peer_addr,
+                crate::filter::redact_zone(&zone)
+            );
             write_reply(
                 &mut stream,
                 554,

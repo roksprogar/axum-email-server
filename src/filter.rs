@@ -17,8 +17,10 @@ use mail_auth::{MessageAuthenticator, RecordSet};
 /// none of `zones`. A zone lists an IP when `<reversed-ip>.<zone>` resolves to
 /// a listing code (see [`is_listing_code`]); an NXDOMAIN, an error code or any
 /// lookup error is treated as "not listed" so a flaky or refusing blocklist
-/// can't wedge the mail flow. IPv6 peers are looked up under the nibble-reversed
-/// form.
+/// can't wedge the mail flow. Error codes are logged as warnings, since they
+/// mean the zone is misconfigured (bad DQS key, shared resolver) and the check
+/// is silently doing nothing. IPv6 peers are looked up under the
+/// nibble-reversed form.
 pub async fn dnsbl_listed(
     authenticator: &MessageAuthenticator,
     ip: IpAddr,
@@ -27,29 +29,53 @@ pub async fn dnsbl_listed(
     let reversed = reverse_ip(ip);
     for zone in zones {
         let query = format!("{}.{}", reversed, zone.trim_end_matches('.'));
-        match authenticator
+        if let Ok(records) = authenticator
             .ipv4_lookup(
                 query.as_str(),
                 None::<&NoCache<Box<str>, RecordSet<Ipv4Addr>>>,
             )
             .await
         {
-            Ok(records) if records.rrset.iter().any(|a| is_listing_code(*a)) => {
-                return Some(zone.clone())
+            if records.rrset.iter().any(|a| is_listing_code(*a)) {
+                return Some(zone.clone());
             }
-            _ => {}
+            if let Some(code) = records.rrset.iter().find(|a| is_error_code(**a)) {
+                tracing::warn!(
+                    "DNSBL {} answered error code {} for {} — check the zone/key and resolver",
+                    redact_zone(zone),
+                    code,
+                    ip
+                );
+            }
         }
     }
     None
 }
 
-/// Whether a DNSBL answer means "listed". Listings are in 127.0.0.0/8, but
-/// 127.255.255.0/24 is reserved for error codes (e.g. Spamhaus answers
-/// 127.255.255.254 to queries via public/shared resolvers), which must not
-/// block mail.
+/// Whether a DNSBL answer means "listed". Listings are in 127.0.0.0/8, except
+/// for the error codes (see [`is_error_code`]), which must not block mail.
 pub fn is_listing_code(answer: Ipv4Addr) -> bool {
+    answer.octets()[0] == 127 && !is_error_code(answer)
+}
+
+/// Whether a DNSBL answer is an error code: 127.255.255.0/24 is reserved for
+/// them (e.g. Spamhaus answers 127.255.255.254 to queries via public/shared
+/// resolvers).
+pub fn is_error_code(answer: Ipv4Addr) -> bool {
     let o = answer.octets();
-    o[0] == 127 && !(o[1] == 255 && o[2] == 255)
+    o[0] == 127 && o[1] == 255 && o[2] == 255
+}
+
+/// `zone` safe to log: a Spamhaus DQS zone (`<key>.zen.dq.spamhaus.net`)
+/// embeds the secret key as its first label, so that label is masked.
+pub fn redact_zone(zone: &str) -> String {
+    let zone = zone.trim_end_matches('.');
+    match zone.split_once('.') {
+        Some((_, rest)) if rest.ends_with(".dq.spamhaus.net") => {
+            format!("<key>.{rest}")
+        }
+        _ => zone.to_string(),
+    }
 }
 
 /// Formats `ip` in the reversed form DNSBLs (and PTR) use as the DNS label:
@@ -168,6 +194,22 @@ mod tests {
         assert!(!is_listing_code(Ipv4Addr::new(127, 255, 255, 252)));
         assert!(!is_listing_code(Ipv4Addr::new(127, 255, 255, 255)));
         assert!(!is_listing_code(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_error_code(Ipv4Addr::new(127, 255, 255, 254)));
+        assert!(!is_error_code(Ipv4Addr::new(127, 0, 0, 2)));
+    }
+
+    #[test]
+    fn redact_zone_masks_dqs_key_only() {
+        assert_eq!(
+            redact_zone("abc123secret.zen.dq.spamhaus.net"),
+            "<key>.zen.dq.spamhaus.net"
+        );
+        assert_eq!(
+            redact_zone("abc123secret.zen.dq.spamhaus.net."),
+            "<key>.zen.dq.spamhaus.net"
+        );
+        assert_eq!(redact_zone("zen.spamhaus.org"), "zen.spamhaus.org");
+        assert_eq!(redact_zone("bl.spamcop.net"), "bl.spamcop.net");
     }
 
     #[test]
