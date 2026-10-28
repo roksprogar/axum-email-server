@@ -15,9 +15,10 @@ use mail_auth::{MessageAuthenticator, RecordSet};
 
 /// Returns the first DNSBL zone that lists `ip`, or `None` when it's listed in
 /// none of `zones`. A zone lists an IP when `<reversed-ip>.<zone>` resolves to
-/// any A record (DNSBLs conventionally answer in 127.0.0.0/8); an NXDOMAIN or
-/// any lookup error is treated as "not listed" so a flaky blocklist can't wedge
-/// the mail flow. IPv6 peers are looked up under the nibble-reversed form.
+/// a listing code (see [`is_listing_code`]); an NXDOMAIN, an error code or any
+/// lookup error is treated as "not listed" so a flaky or refusing blocklist
+/// can't wedge the mail flow. IPv6 peers are looked up under the nibble-reversed
+/// form.
 pub async fn dnsbl_listed(
     authenticator: &MessageAuthenticator,
     ip: IpAddr,
@@ -33,11 +34,22 @@ pub async fn dnsbl_listed(
             )
             .await
         {
-            Ok(records) if !records.rrset.is_empty() => return Some(zone.clone()),
+            Ok(records) if records.rrset.iter().any(|a| is_listing_code(*a)) => {
+                return Some(zone.clone())
+            }
             _ => {}
         }
     }
     None
+}
+
+/// Whether a DNSBL answer means "listed". Listings are in 127.0.0.0/8, but
+/// 127.255.255.0/24 is reserved for error codes (e.g. Spamhaus answers
+/// 127.255.255.254 to queries via public/shared resolvers), which must not
+/// block mail.
+pub fn is_listing_code(answer: Ipv4Addr) -> bool {
+    let o = answer.octets();
+    o[0] == 127 && !(o[1] == 255 && o[2] == 255)
 }
 
 /// Formats `ip` in the reversed form DNSBLs (and PTR) use as the DNS label:
@@ -146,6 +158,17 @@ impl Greylist {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn listing_codes_exclude_dnsbl_error_codes() {
+        assert!(is_listing_code(Ipv4Addr::new(127, 0, 0, 2)));
+        assert!(is_listing_code(Ipv4Addr::new(127, 0, 0, 11)));
+        // Spamhaus error codes (public resolver, rate limit, typo'd zone)
+        assert!(!is_listing_code(Ipv4Addr::new(127, 255, 255, 254)));
+        assert!(!is_listing_code(Ipv4Addr::new(127, 255, 255, 252)));
+        assert!(!is_listing_code(Ipv4Addr::new(127, 255, 255, 255)));
+        assert!(!is_listing_code(Ipv4Addr::new(10, 0, 0, 1)));
+    }
 
     #[test]
     fn reverse_ipv4_reverses_octets() {
