@@ -21,7 +21,9 @@ impl MailService {
     /// message's `Message-ID`, so the reply stays in the same thread. `From`
     /// is the address the original mail was addressed to (e.g.
     /// `contact@leanhigh.com`), keeping the conversation on that identity;
-    /// `To` is the original sender.
+    /// `To` is the original's reply address (its `Reply-To`/`From`, see
+    /// [`RawMessage::reply_to`](crate::RawMessage::reply_to)), falling back to
+    /// the envelope sender for messages stored without one.
     ///
     /// The delivery outcome is persisted to `mail_replies` either way; on a
     /// successful send the parent message is stamped `replied_at`. A send
@@ -83,9 +85,13 @@ impl MailService {
         let reply_mid_bare = format!("{}@{}", Uuid::new_v4(), reply_domain);
         let reply_mid_wire = format!("<{reply_mid_bare}>");
 
+        // Messages stored before `reply_to` existed have none; their envelope
+        // sender is the best address we have.
+        let to = original.reply_to.unwrap_or(original.envelope_from);
+
         let reply = OutgoingReply {
             from: original.address,
-            to: original.envelope_from,
+            to,
             subject,
             message_id: Some(reply_mid_wire),
             in_reply_to: original_bracketed,
@@ -163,6 +169,7 @@ mod tests {
             references: None,
             envelope_from: "someone@example.com".to_string(),
             envelope_to: "contact@leanhigh.com".to_string(),
+            reply_to: None,
             from_display: Some("Someone".to_string()),
             subject: Some("Hello there".to_string()),
             body_text: Some("hi".to_string()),
@@ -214,6 +221,33 @@ mod tests {
         assert_eq!(r.subject, "Re: Hello there");
         assert_eq!(r.in_reply_to.as_deref(), Some("<abc@example.com>"));
         assert_eq!(r.references.as_deref(), Some("<abc@example.com>"));
+    }
+
+    #[tokio::test]
+    async fn send_reply_goes_to_reply_to_not_envelope_sender() {
+        // A Brevo-relayed contact form: the envelope sender is Brevo's bounce
+        // address, the visitor is only in Reply-To.
+        let mut storage = MockStorage::new();
+        storage.expect_get_message().returning(|_| {
+            Ok(Some(StoredMessage {
+                envelope_from: "bounces-123@gw.d.sender-sib.com".to_string(),
+                reply_to: Some("visitor@example.org".to_string()),
+                ..stored_message()
+            }))
+        });
+        storage.expect_save_reply().returning(|_| Ok(1));
+        storage.expect_mark_replied().returning(|_| Ok(()));
+
+        let sender = RecordingSender::default();
+        let recorded = sender.sent.clone();
+        let service = service_with(storage, sender);
+
+        service
+            .send_reply(1, Some("answer".to_string()), None, None)
+            .await
+            .expect("reply sent");
+
+        assert_eq!(recorded.lock().unwrap()[0].to, "visitor@example.org");
     }
 
     #[tokio::test]

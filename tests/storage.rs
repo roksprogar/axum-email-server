@@ -12,6 +12,7 @@ fn inbound(
         address: address.to_string(),
         envelope_from: from.to_string(),
         envelope_to: address.to_string(),
+        reply_to: None,
         message_id: message_id.map(str::to_string),
         in_reply_to: in_reply_to.map(str::to_string),
         references: None,
@@ -32,6 +33,7 @@ async fn save_message_assigns_increasing_ids() {
         address: "contact@leanhigh.com".to_string(),
         envelope_from: "someone@example.com".to_string(),
         envelope_to: "contact@leanhigh.com".to_string(),
+        reply_to: None,
         message_id: None,
         in_reply_to: None,
         references: None,
@@ -188,4 +190,48 @@ async fn subject_fallback_threads_headerless_replies() {
         .await
         .unwrap();
     assert_eq!(convs.len(), 2);
+}
+
+#[tokio::test]
+async fn subject_fallback_groups_by_reply_to_not_envelope_sender() {
+    // Brevo-relayed mail: a different bounce address per message as the
+    // envelope sender, the visitor only in Reply-To.
+    let storage = InMemoryStorage::new().with_addresses(["contact@leanhigh.com"]);
+    for (bounce, mid, subject) in [
+        (
+            "bounces-1@gw.d.sender-sib.com",
+            "m1@example.com",
+            "Question",
+        ),
+        (
+            "bounces-2@gw.d.sender-sib.com",
+            "m2@example.com",
+            "Re: Question",
+        ),
+    ] {
+        storage
+            .save_message(RawMessage {
+                reply_to: Some("visitor@example.org".to_string()),
+                ..inbound(
+                    "contact@leanhigh.com",
+                    bounce,
+                    Some(mid),
+                    None,
+                    Some(subject),
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    let convs = storage
+        .list_conversations(&MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        convs.len(),
+        1,
+        "same visitor groups despite different bounces"
+    );
+    assert_eq!(convs[0].message_count, 2);
 }

@@ -631,6 +631,15 @@ async fn store_message(
         .and_then(|a| a.first())
         .and_then(|a| a.name())
         .map(str::to_string);
+    let header_address = |a: Option<&mail_parser::Address>| {
+        a.and_then(|a| a.first())
+            .and_then(|a| a.address())
+            .map(str::to_string)
+    };
+    let reply_to = parsed
+        .as_ref()
+        .and_then(|m| header_address(m.reply_to()).or_else(|| header_address(m.from())))
+        .or_else(|| (!from.is_empty()).then(|| from.to_string()));
     let subject = parsed
         .as_ref()
         .and_then(|m| m.subject())
@@ -649,6 +658,7 @@ async fn store_message(
             address: rcpt.clone(),
             envelope_from: from.to_string(),
             envelope_to: rcpt.clone(),
+            reply_to: reply_to.clone(),
             message_id: message_id.clone(),
             in_reply_to: in_reply_to.clone(),
             references: references.clone(),
@@ -1115,6 +1125,83 @@ mod tests {
         client.write_all(b"QUIT\r\n").await.unwrap();
         client.flush().await.unwrap();
         let _ = handle.await;
+    }
+    /// Reply sender that records what it was asked to send.
+    #[derive(Clone, Default)]
+    struct RecordingSender {
+        sent: Arc<Mutex<Vec<OutgoingReply>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSender for RecordingSender {
+        async fn send(&self, reply: OutgoingReply) -> Result<(), MailError> {
+            self.sent.lock().unwrap().push(reply);
+            Ok(())
+        }
+    }
+
+    /// Ingests `raw` from envelope sender `from`, then replies to it, returning
+    /// the stored reply address and the address the reply was sent to.
+    async fn ingest_and_reply(raw: &[u8], from: &str) -> (Option<String>, String) {
+        let storage = Arc::new(InMemoryStorage::new().with_addresses(["contact@here.test"]));
+        let sender = RecordingSender::default();
+        let recorded = sender.sent.clone();
+        let service =
+            MailService::with_sender(MailConfig::default(), storage.clone(), Arc::new(sender))
+                .expect("failed to build test MailService (needs a readable /etc/resolv.conf)");
+        let dyn_storage: Arc<dyn Storage> = storage;
+
+        store_message(
+            raw,
+            from,
+            &["contact@here.test".to_string()],
+            "pass".to_string(),
+            "pass".to_string(),
+            &dyn_storage,
+        )
+        .await
+        .expect("store message");
+        let id = dyn_storage
+            .list_messages(&Default::default())
+            .await
+            .unwrap()[0]
+            .id;
+        let stored = dyn_storage.get_message(id).await.unwrap().unwrap();
+
+        service
+            .send_reply(id, Some("answer".to_string()), None, None)
+            .await
+            .expect("reply sent");
+        let to = recorded.lock().unwrap()[0].to.clone();
+        (stored.reply_to, to)
+    }
+
+    #[tokio::test]
+    async fn reply_goes_to_reply_to_not_envelope_sender() {
+        // A Brevo-relayed contact form: Brevo's bounce address is the envelope
+        // sender, the visitor is only in Reply-To.
+        let raw = b"From: Site <noreply@site.test>\r\n\
+Reply-To: Visitor <visitor@example.org>\r\n\
+To: contact@here.test\r\n\
+Subject: Contact form\r\n\
+Message-ID: <form-1@site.test>\r\n\
+\r\n\
+Hello\r\n";
+        let (reply_to, to) = ingest_and_reply(raw, "bounces-123@gw.d.sender-sib.com").await;
+        assert_eq!(reply_to.as_deref(), Some("visitor@example.org"));
+        assert_eq!(to, "visitor@example.org");
+    }
+
+    #[tokio::test]
+    async fn reply_falls_back_to_from_header_without_reply_to() {
+        let raw = b"From: Someone <someone@example.org>\r\n\
+To: contact@here.test\r\n\
+Subject: Hi\r\n\
+\r\n\
+Hello\r\n";
+        let (reply_to, to) = ingest_and_reply(raw, "bounces-456@relay.test").await;
+        assert_eq!(reply_to.as_deref(), Some("someone@example.org"));
+        assert_eq!(to, "someone@example.org");
     }
 
     // ---- spam / abuse filtering ----

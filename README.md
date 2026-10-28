@@ -119,6 +119,7 @@ CREATE TABLE mail_messages (
     message_id     TEXT,
     envelope_from  TEXT NOT NULL,
     envelope_to    TEXT NOT NULL,
+    reply_to       TEXT,
     from_display   TEXT,
     subject        TEXT,
     body_text      TEXT,

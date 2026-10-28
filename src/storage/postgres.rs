@@ -112,20 +112,23 @@ impl Storage for PostgresStorage {
         };
 
         // 2) Header-less fallback: same inbox + same sender + same normalized
-        //    subject — catches senders that drop In-Reply-To/References.
+        //    subject — catches senders that drop In-Reply-To/References. The
+        //    sender is the reply address, not the envelope sender (see
+        //    `RawMessage::reply_address`); rows from before `reply_to` existed
+        //    fall back to their envelope sender.
         if conversation_id.is_none() {
             if let Some(ref subj) = subject_normalized {
                 conversation_id = sqlx::query_scalar!(
                     r#"SELECT conversation_id AS "conversation_id!"
                        FROM mail_messages
                        WHERE address_id = $1
-                         AND envelope_from = $2
+                         AND COALESCE(reply_to, envelope_from) = $2
                          AND subject_normalized = $3
                          AND conversation_id IS NOT NULL
                        ORDER BY received_at DESC
                        LIMIT 1"#,
                     address_id,
-                    message.envelope_from,
+                    message.reply_address(),
                     subj
                 )
                 .fetch_optional(&mut *tx)
@@ -137,9 +140,9 @@ impl Storage for PostgresStorage {
         let id = sqlx::query_scalar!(
             "INSERT INTO mail_messages
                 (address_id, message_id, in_reply_to, references_header, subject_normalized,
-                 conversation_id, envelope_from, envelope_to, from_display, subject,
+                 conversation_id, envelope_from, envelope_to, reply_to, from_display, subject,
                  body_text, body_html, raw_mime, spf_result, dkim_result)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              RETURNING id",
             address_id,
             message.message_id,
@@ -149,6 +152,7 @@ impl Storage for PostgresStorage {
             conversation_id,
             message.envelope_from,
             message.envelope_to,
+            message.reply_to,
             message.from_display,
             message.subject,
             message.body_text,
@@ -198,6 +202,7 @@ impl Storage for PostgresStorage {
                 (a.local_part || '@' || d.domain) AS "address!",
                 m.message_id,
                 m.envelope_from,
+                m.reply_to,
                 m.from_display,
                 m.subject,
                 m.spf_result,
@@ -232,6 +237,7 @@ impl Storage for PostgresStorage {
                 address: r.address,
                 message_id: r.message_id,
                 envelope_from: r.envelope_from,
+                reply_to: r.reply_to,
                 from_display: r.from_display,
                 subject: r.subject,
                 spf_result: r.spf_result,
@@ -255,6 +261,7 @@ impl Storage for PostgresStorage {
                 m.references_header,
                 m.envelope_from,
                 m.envelope_to,
+                m.reply_to,
                 m.from_display,
                 m.subject,
                 m.body_text,
@@ -325,6 +332,7 @@ impl Storage for PostgresStorage {
             references: row.references_header,
             envelope_from: row.envelope_from,
             envelope_to: row.envelope_to,
+            reply_to: row.reply_to,
             from_display: row.from_display,
             subject: row.subject,
             body_text: row.body_text,
@@ -395,6 +403,7 @@ impl Storage for PostgresStorage {
                     m.subject,
                     m.from_display,
                     m.envelope_from,
+                    m.reply_to,
                     m.spf_result,
                     m.dkim_result,
                     m.received_at,
@@ -407,7 +416,7 @@ impl Storage for PostgresStorage {
             latest AS (
                 SELECT DISTINCT ON (conversation_id)
                     conversation_id, address, domain, subject, from_display,
-                    envelope_from, spf_result, dkim_result, received_at
+                    envelope_from, reply_to, spf_result, dkim_result, received_at
                 FROM msgs
                 ORDER BY conversation_id, received_at DESC, id DESC
             ),
@@ -433,6 +442,7 @@ impl Storage for PostgresStorage {
                 l.subject,
                 l.from_display AS last_from_display,
                 l.envelope_from AS "last_envelope_from!",
+                l.reply_to AS last_reply_to,
                 (a.msg_count + COALESCE(rp.reply_count, 0)) AS "message_count!",
                 a.unread_count AS "unread_count!",
                 GREATEST(a.last_received_at, COALESCE(rp.last_reply_at, a.last_received_at)) AS "last_activity_at!",
@@ -467,6 +477,7 @@ impl Storage for PostgresStorage {
                 subject: r.subject,
                 last_from_display: r.last_from_display,
                 last_envelope_from: r.last_envelope_from,
+                last_reply_to: r.last_reply_to,
                 message_count: r.message_count,
                 unread_count: r.unread_count,
                 last_activity_at: r.last_activity_at,
@@ -493,6 +504,7 @@ impl Storage for PostgresStorage {
                 m.references_header,
                 m.envelope_from,
                 m.envelope_to,
+                m.reply_to,
                 m.from_display,
                 m.subject,
                 m.body_text,
@@ -572,6 +584,7 @@ impl Storage for PostgresStorage {
                 references: r.references_header,
                 envelope_from: r.envelope_from,
                 envelope_to: r.envelope_to,
+                reply_to: r.reply_to,
                 from_display: r.from_display,
                 subject: r.subject,
                 body_text: r.body_text,

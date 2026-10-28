@@ -127,6 +127,7 @@ fn summary_of(record: &Record) -> MessageSummary {
         address: record.msg.address.clone(),
         message_id: record.msg.message_id.clone(),
         envelope_from: record.msg.envelope_from.clone(),
+        reply_to: record.msg.reply_to.clone(),
         from_display: record.msg.from_display.clone(),
         subject: record.msg.subject.clone(),
         spf_result: record.msg.spf_result.clone(),
@@ -191,12 +192,13 @@ impl Storage for InMemoryStorage {
             }
         }
 
-        // 2) Header-less fallback: same inbox + same sender + same normalized subject.
+        // 2) Header-less fallback: same inbox + same sender (reply address, see
+        //    `RawMessage::reply_address`) + same normalized subject.
         if best.is_none() {
             if let Some(ref subj) = subj_norm {
                 for r in records.iter() {
                     if r.msg.address.eq_ignore_ascii_case(&message.address)
-                        && r.msg.envelope_from == message.envelope_from
+                        && r.msg.reply_address() == message.reply_address()
                         && normalize_subject(r.msg.subject.as_deref()).as_deref()
                             == Some(subj.as_str())
                         && best.is_none_or(|(bts, _)| r.received_at > bts)
@@ -305,6 +307,7 @@ impl Storage for InMemoryStorage {
             references: r.msg.references.clone(),
             envelope_from: r.msg.envelope_from.clone(),
             envelope_to: r.msg.envelope_to.clone(),
+            reply_to: r.msg.reply_to.clone(),
             from_display: r.msg.from_display.clone(),
             subject: r.msg.subject.clone(),
             body_text: r.msg.body_text.clone(),
@@ -438,6 +441,7 @@ impl Storage for InMemoryStorage {
                 subject: latest.msg.subject.clone(),
                 last_from_display: latest.msg.from_display.clone(),
                 last_envelope_from: latest.msg.envelope_from.clone(),
+                last_reply_to: latest.msg.reply_to.clone(),
                 message_count: msgs.len() as i64 + reply_count,
                 unread_count,
                 last_activity_at,
@@ -497,6 +501,7 @@ impl Storage for InMemoryStorage {
                 references: r.msg.references.clone(),
                 envelope_from: r.msg.envelope_from.clone(),
                 envelope_to: r.msg.envelope_to.clone(),
+                reply_to: r.msg.reply_to.clone(),
                 from_display: r.msg.from_display.clone(),
                 subject: r.msg.subject.clone(),
                 body_text: r.msg.body_text.clone(),

@@ -17,6 +17,10 @@ pub struct RawMessage {
     pub address: String,
     pub envelope_from: String,
     pub envelope_to: String,
+    /// Where replies go: the `Reply-To` header address, else the `From`
+    /// header address, else the envelope sender. Relays such as Brevo put a
+    /// bounce address in the envelope, so `envelope_from` is not the person.
+    pub reply_to: Option<String>,
     pub message_id: Option<String>,
     /// `In-Reply-To` header, used to thread this message into an existing
     /// conversation on ingest.
@@ -33,6 +37,16 @@ pub struct RawMessage {
     pub spf_result: Option<String>,
     /// "pass"/"fail"/"neutral"/"temperror"/"permerror"/"none".
     pub dkim_result: Option<String>,
+}
+
+impl RawMessage {
+    /// The person behind the message: `reply_to`, else the envelope sender.
+    /// Used both to address replies and to group header-less follow-ups, since
+    /// a relay's envelope sender (e.g. a per-message Brevo bounce address) is
+    /// not the person.
+    pub(crate) fn reply_address(&self) -> &str {
+        self.reply_to.as_deref().unwrap_or(&self.envelope_from)
+    }
 }
 
 /// Strip leading `Re:`/`Fwd:`/`Fw:` prefixes (any number, any case, optional
@@ -92,6 +106,8 @@ pub struct MessageSummary {
     pub address: String,
     pub message_id: Option<String>,
     pub envelope_from: String,
+    /// See [`RawMessage::reply_to`]; `None` for messages stored before it existed.
+    pub reply_to: Option<String>,
     pub from_display: Option<String>,
     pub subject: Option<String>,
     pub spf_result: Option<String>,
@@ -115,6 +131,8 @@ pub struct StoredMessage {
     pub references: Option<String>,
     pub envelope_from: String,
     pub envelope_to: String,
+    /// See [`RawMessage::reply_to`]; `None` for messages stored before it existed.
+    pub reply_to: Option<String>,
     pub from_display: Option<String>,
     pub subject: Option<String>,
     pub body_text: Option<String>,
@@ -141,6 +159,8 @@ pub struct ConversationSummary {
     pub subject: Option<String>,
     pub last_from_display: Option<String>,
     pub last_envelope_from: String,
+    /// The latest inbound message's reply address (see [`RawMessage::reply_to`]).
+    pub last_reply_to: Option<String>,
     /// Total items in the conversation (inbound messages + our replies).
     pub message_count: i64,
     /// Inbound messages not yet marked read.

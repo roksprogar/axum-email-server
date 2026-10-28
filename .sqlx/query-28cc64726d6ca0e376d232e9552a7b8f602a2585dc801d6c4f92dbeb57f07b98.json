@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT conversation_id AS \"conversation_id!\"\n                       FROM mail_messages\n                       WHERE address_id = $1\n                         AND COALESCE(reply_to, envelope_from) = $2\n                         AND subject_normalized = $3\n                         AND conversation_id IS NOT NULL\n                       ORDER BY received_at DESC\n                       LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "conversation_id!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "28cc64726d6ca0e376d232e9552a7b8f602a2585dc801d6c4f92dbeb57f07b98"
+}

@@ -59,6 +59,7 @@ CREATE TABLE mail_messages (
     conversation_id    BIGINT,
     envelope_from      TEXT NOT NULL,
     envelope_to        TEXT NOT NULL,
+    reply_to           TEXT,
     from_display       TEXT,
     subject            TEXT,
     body_text          TEXT,
@@ -95,6 +96,7 @@ fn sample_message() -> RawMessage {
         address: "contact@leanhigh.com".to_string(),
         envelope_from: "someone@example.com".to_string(),
         envelope_to: "contact@leanhigh.com".to_string(),
+        reply_to: Some("visitor@example.org".to_string()),
         message_id: Some("mid-1@example.com".to_string()),
         in_reply_to: None,
         references: None,
@@ -162,6 +164,7 @@ async fn postgres_storage_roundtrip() {
 
     let msg = storage.get_message(id).await.unwrap().expect("message");
     assert_eq!(msg.envelope_from, "someone@example.com");
+    assert_eq!(msg.reply_to.as_deref(), Some("visitor@example.org"));
     assert!(msg.read_at.is_none());
 
     // mark_read stamps read_at.

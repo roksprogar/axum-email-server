@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH msgs AS (\n                SELECT\n                    m.id,\n                    COALESCE(m.conversation_id, m.id) AS conversation_id,\n                    (a.local_part || '@' || d.domain) AS address,\n                    d.domain AS domain,\n                    m.subject,\n                    m.from_display,\n                    m.envelope_from,\n                    m.reply_to,\n                    m.spf_result,\n                    m.dkim_result,\n                    m.received_at,\n                    m.read_at\n                FROM mail_messages m\n                JOIN mail_addresses a ON a.id = m.address_id\n                JOIN mail_domains d ON d.id = a.domain_id\n                WHERE a.active = true\n            ),\n            latest AS (\n                SELECT DISTINCT ON (conversation_id)\n                    conversation_id, address, domain, subject, from_display,\n                    envelope_from, reply_to, spf_result, dkim_result, received_at\n                FROM msgs\n                ORDER BY conversation_id, received_at DESC, id DESC\n            ),\n            agg AS (\n                SELECT conversation_id,\n                       COUNT(*) AS msg_count,\n                       COUNT(*) FILTER (WHERE read_at IS NULL) AS unread_count,\n                       MAX(received_at) AS last_received_at\n                FROM msgs\n                GROUP BY conversation_id\n            ),\n            rep AS (\n                SELECT COALESCE(m.conversation_id, m.id) AS conversation_id,\n                       COUNT(*) AS reply_count,\n                       MAX(r.sent_at) AS last_reply_at\n                FROM mail_replies r\n                JOIN mail_messages m ON m.id = r.message_id\n                GROUP BY COALESCE(m.conversation_id, m.id)\n            )\n            SELECT\n                l.conversation_id AS \"conversation_id!\",\n                l.address AS \"address!\",\n                l.subject,\n                l.from_display AS last_from_display,\n                l.envelope_from AS \"last_envelope_from!\",\n                l.reply_to AS last_reply_to,\n                (a.msg_count + COALESCE(rp.reply_count, 0)) AS \"message_count!\",\n                a.unread_count AS \"unread_count!\",\n                GREATEST(a.last_received_at, COALESCE(rp.last_reply_at, a.last_received_at)) AS \"last_activity_at!\",\n                l.spf_result,\n                l.dkim_result,\n                (COALESCE(rp.reply_count, 0) > 0) AS \"replied!\"\n            FROM latest l\n            JOIN agg a ON a.conversation_id = l.conversation_id\n            LEFT JOIN rep rp ON rp.conversation_id = l.conversation_id\n            WHERE ($1::text IS NULL OR l.domain = $1)\n              AND ($2::text IS NULL OR l.address = $2)\n              AND ($3::bool = false OR a.unread_count > 0)\n            ORDER BY GREATEST(a.last_received_at, COALESCE(rp.last_reply_at, a.last_received_at)) DESC,\n                     l.conversation_id DESC\n            LIMIT $4 OFFSET $5\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "conversation_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "address!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_from_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "last_envelope_from!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_reply_to",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "message_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "unread_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_activity_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "spf_result",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "dkim_result",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "replied!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bool",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      true,
+      true,
+      false,
+      true,
+      null,
+      null,
+      null,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "eca069a43df2eed53c354fbbe5860a6e0ba34db201c83a7da582c5253a18d247"
+}
