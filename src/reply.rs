@@ -14,6 +14,49 @@ fn bracket_id(mid: &str) -> String {
     }
 }
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Append the original message as a quote, the way a mail client does, so the
+/// recipient sees the history below our answer. Each side quoting the previous
+/// mail is what carries the whole thread forward.
+fn quote_original(
+    body_text: Option<String>,
+    body_html: Option<String>,
+    attribution: &str,
+    original_text: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(original) = original_text.map(str::trim_end).filter(|t| !t.is_empty()) else {
+        return (body_text, body_html);
+    };
+
+    let text = body_text.map(|t| {
+        let quoted: Vec<String> = original
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
+            .collect();
+        format!("{}\n\n{attribution}\n{}", t.trim_end(), quoted.join("\n"))
+    });
+    let html = body_html.map(|h| {
+        format!(
+            "{h}<br><div>{}</div><blockquote style=\"margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex\">{}</blockquote>",
+            escape_html(attribution),
+            escape_html(original).replace('\n', "<br>")
+        )
+    });
+    (text, html)
+}
+
 impl MailService {
     /// Send a reply to a stored message and record the outcome.
     ///
@@ -89,6 +132,23 @@ impl MailService {
         // sender is the best address we have.
         let to = original.reply_to.unwrap_or(original.envelope_from);
 
+        // Only the outbound mail carries the quote; the stored reply keeps just
+        // our new text, since the conversation view already shows the history.
+        let who = match original.from_display.as_deref() {
+            Some(name) if !name.trim().is_empty() => format!("{} <{to}>", name.trim()),
+            _ => to.clone(),
+        };
+        let attribution = format!(
+            "On {}, {who} wrote:",
+            original.received_at.format("%a, %-d %b %Y at %H:%M UTC")
+        );
+        let (quoted_text, quoted_html) = quote_original(
+            body_text.clone(),
+            body_html.clone(),
+            &attribution,
+            original.body_text.as_deref(),
+        );
+
         let reply = OutgoingReply {
             from: original.address,
             to,
@@ -96,8 +156,8 @@ impl MailService {
             message_id: Some(reply_mid_wire),
             in_reply_to: original_bracketed,
             references,
-            body_text: body_text.clone(),
-            body_html: body_html.clone(),
+            body_text: quoted_text,
+            body_html: quoted_html,
         };
 
         let send_result = self.sender.send(reply).await;
@@ -221,6 +281,47 @@ mod tests {
         assert_eq!(r.subject, "Re: Hello there");
         assert_eq!(r.in_reply_to.as_deref(), Some("<abc@example.com>"));
         assert_eq!(r.references.as_deref(), Some("<abc@example.com>"));
+    }
+
+    #[tokio::test]
+    async fn send_reply_quotes_original_but_stores_only_new_text() {
+        let mut storage = MockStorage::new();
+        storage.expect_get_message().returning(|_| {
+            Ok(Some(StoredMessage {
+                body_text: Some("first line\n\nsecond <b>".to_string()),
+                ..stored_message()
+            }))
+        });
+        storage
+            .expect_save_reply()
+            .withf(|r| r.body_text.as_deref() == Some("my answer"))
+            .returning(|_| Ok(1));
+        storage.expect_mark_replied().returning(|_| Ok(()));
+
+        let sender = RecordingSender::default();
+        let recorded = sender.sent.clone();
+        let service = service_with(storage, sender);
+
+        service
+            .send_reply(
+                1,
+                Some("my answer".to_string()),
+                Some("<p>my answer</p>".to_string()),
+                None,
+            )
+            .await
+            .expect("reply sent");
+
+        let sent = recorded.lock().unwrap();
+        let text = sent[0].body_text.as_deref().unwrap();
+        assert!(text.starts_with("my answer\n\nOn "));
+        assert!(
+            text.contains("Someone <someone@example.com> wrote:\n> first line\n>\n> second <b>")
+        );
+        let html = sent[0].body_html.as_deref().unwrap();
+        assert!(html.starts_with("<p>my answer</p>"));
+        assert!(html.contains("<blockquote"));
+        assert!(html.contains("first line<br><br>second &lt;b&gt;"));
     }
 
     #[tokio::test]
