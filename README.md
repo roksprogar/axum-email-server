@@ -35,7 +35,7 @@ Enable the backends you want:
 
 ```toml
 [dependencies]
-axum-email-server = { version = "0.1", features = ["postgres", "axum"] }
+axum-email-server = { version = "0.3", features = ["postgres", "axum"] }
 ```
 
 ### In-memory (tests)
