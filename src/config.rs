@@ -27,7 +27,7 @@ pub struct MailConfig {
     /// Address the SMTP receive loop binds to, e.g. "0.0.0.0:25".
     pub smtp_bind_addr: String,
 
-    /// This server's own hostname, e.g. "localmail.lifetivation.com".
+    /// This server's own hostname, e.g. "mail.example.com".
     /// Passed to SPF verification as the receiving host's identity.
     pub hostname: String,
 

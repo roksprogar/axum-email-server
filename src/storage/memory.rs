@@ -270,10 +270,7 @@ impl Storage for InMemoryStorage {
                         return false;
                     }
                 }
-                if filter.unread_only && r.read_at.is_some() {
-                    return false;
-                }
-                true
+                !(filter.unread_only && r.read_at.is_some())
             })
             .collect();
 
